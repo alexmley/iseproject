@@ -12,6 +12,9 @@ import time
 from stable_baselines3 import PPO
 from platformer_env import PlatformerGauntletEnv
 
+import os
+os.environ["SDL_VIDEODRIVER"] = ""
+
 
 def main():
     parser = argparse.ArgumentParser()
