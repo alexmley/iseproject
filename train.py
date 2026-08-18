@@ -87,7 +87,7 @@ def main():
     env_fns = [make_env(seed=args.seed + i) for i in range(args.n_envs)]
     vec_env = DummyVecEnv(env_fns)
 
-    lr_schedule = get_linear_fn(3e-4, 1e-5, 1.0)
+    lr_schedule = 3e-4
 
     if args.resume and os.path.exists(MODEL_PATH):
         print(f"Resuming from {MODEL_PATH}")
@@ -106,7 +106,7 @@ def main():
             gamma=0.99,
             gae_lambda=0.95,
             # exploration — high ent_coef prevents entropy collapse
-            ent_coef=0.08,
+            ent_coef=0.01,
             # clipping / value
             clip_range=0.2,
             vf_coef=0.5,
