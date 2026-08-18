@@ -585,18 +585,37 @@ class PlatformerGauntletEnv(gym.Env):
             platform.update(self.t)
 
 
+
         # --------------------------------------------------------------
         # Horizontal movement
         # --------------------------------------------------------------
 
+        ACCELERATION = 2.0
+        DECELERATION = 2.0
+
         if horiz == 1:
-            self.vx = -MOVE_SPEED
+            self.vx = max(
+                self.vx - ACCELERATION,
+                -MOVE_SPEED,
+            )
 
         elif horiz == 2:
-            self.vx = MOVE_SPEED
+            self.vx = min(
+                self.vx + ACCELERATION,
+                MOVE_SPEED,
+            )
 
         else:
-            self.vx = 0.0
+            if self.vx > 0:
+                self.vx = max(
+                    0.0,
+                    self.vx - DECELERATION,
+                )
+            elif self.vx < 0:
+                self.vx = min(
+                    0.0,
+                    self.vx + DECELERATION,
+                )
 
 
         # --------------------------------------------------------------
@@ -654,105 +673,105 @@ class PlatformerGauntletEnv(gym.Env):
         # reaching new platforms.
         # --------------------------------------------------------------
 
-        horizontal_progress = (
-            self.agent_x - previous_x
-        )
-
-        if horizontal_progress > 0:
-
-            reward += (
-                0.005
-                * horizontal_progress
-            )
-
-
         # --------------------------------------------------------------
         # Landing detection
         #
-        # IMPORTANT FIX:
+        # The agent may land on:
+        #   - the platform it is currently on
+        #   - the NEXT platform
         #
-        # The old environment required the centre of the agent to be
-        # above the platform.
-        #
-        # We now use full AABB horizontal overlap.
-        #
-        # This matches the collision logic used by your launcher and
-        # gives the agent the correct physical landing area.
+        # We use AABB horizontal overlap and a swept vertical check
+        # so the agent cannot phase through a platform between frames.
         # --------------------------------------------------------------
 
         landed = False
 
         if self.vy >= 0:
 
-            feet_y = (
-                self.agent_y + AGENT_H
+            feet_y = self.agent_y + AGENT_H
+            previous_feet_y = previous_y + AGENT_H
+
+            # Check current platform and next platform.
+            first_idx = max(
+                0,
+                self.current_platform_idx
             )
 
-            previous_feet_y = (
-                previous_y + AGENT_H
+            last_idx = min(
+                self.current_platform_idx + 1,
+                len(self.platforms) - 1
             )
 
+            for idx in range(first_idx, last_idx + 1):
 
-            for idx, platform in enumerate(
-                self.platforms
-            ):
+                platform = self.platforms[idx]
 
-                # Full horizontal AABB overlap
+                # --------------------------------------------------
+                # Horizontal AABB overlap
+                # --------------------------------------------------
+
                 horizontal_overlap = (
-                    self.agent_x + AGENT_W
-                    > platform.x
-                    and
-                    self.agent_x
-                    < platform.x_end
+                        self.agent_x + AGENT_W
+                        > platform.x
+                        and
+                        self.agent_x
+                        < platform.x_end
                 )
 
                 if not horizontal_overlap:
                     continue
 
+                # --------------------------------------------------
+                # Vertical crossing
+                #
+                # The agent must have been above the platform top
+                # on the previous frame and now be at/below it.
+                #
+                # The extra <= check also handles the case where
+                # the agent starts the frame already overlapping
+                # the platform surface.
+                # --------------------------------------------------
 
-                # The agent must cross the top surface while falling.
                 crossed_platform_top = (
-                    feet_y >= platform.y
-                    and
-                    previous_feet_y <= platform.y
+                        previous_feet_y <= platform.y
+                        and
+                        feet_y >= platform.y
                 )
 
                 if not crossed_platform_top:
                     continue
 
-
+                # --------------------------------------------------
                 # Successful landing
+                # --------------------------------------------------
+
                 self.agent_y = (
-                    platform.y - AGENT_H
+                        platform.y - AGENT_H
                 )
 
                 self.vy = 0.0
                 self.on_ground = True
 
-                self.current_platform_idx = idx
-
                 landed = True
 
-
                 # --------------------------------------------------
-                # New platform reached
+                # Only update progress when reaching a new platform
                 # --------------------------------------------------
 
-                if (
-                    idx
-                    > self.furthest_platform_idx
-                ):
-
-                    # Strong progression reward.
+                if idx > self.furthest_platform_idx:
                     reward += 8.0
 
                     self.furthest_platform_idx = idx
 
-                    # Keep furthest_x consistent.
                     self.furthest_x = max(
                         self.furthest_x,
                         self.agent_x,
                     )
+
+                self.current_platform_idx = max(
+                    self.current_platform_idx,
+                    idx,
+                )
 
                 break
 
