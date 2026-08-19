@@ -1,26 +1,21 @@
 # Precision Platformer Gauntlet
 
-A deterministic pygame platformer built as a Gymnasium environment, designed
+I have created deterministic pygame platformer built as a Gymnasium environment, designed
 to make an RL agent's improvement over training *visually obvious*. The level
-is a fixed sequence of ~40 jumps where the gap size and platform width scale
-on an exponential curve — brutal-looking by the end, but tuned to always stay
+is a fixed sequence of 40 jumps where the gap size and platform width scale
+on an exponential curve — brutal-looking by the end, but altered to always stay
 just barely possible.
 
 ## How the difficulty curve works
 
-Two things escalate exponentially as the level progresses:
-
 - **Gap size** grows from `70px` and asymptotically approaches `90%` of the
   agent's theoretical max jump distance (`~216px`, derived from jump velocity,
-  gravity, and horizontal speed). It never quite reaches the true max, so
-  every jump stays physically completable — it just requires increasingly
-  precise timing and full-speed horizontal movement.
+  gravity, and horizontal speed). It never quite reaches the true max, just makes it extremely difficult.
 - **Platform width** shrinks from `150px` down to a floor of `46px`
-  (roughly 1.8x the agent's own width), so late-level landings require real
-  precision, not just "jump in the general direction."
+  (roughly 1.8x the agent's own width), making jumps for the agent harder.
 
 Starting at platform 14, some platforms also drift vertically (sine wave),
-adding a timing element on top of the spacing/width difficulty.
+adding a timing element on top of the spacing/width difficulty. In v4, I added a toggle for this, where you can set moving_platforms to true or false.
 
 Because gap and width are both deterministic functions of platform index
 (seeded, not random noise), every training run faces the *exact same*
@@ -36,11 +31,17 @@ across episodes and training runs.
 | `play.py` | Loads a trained model and plays it back in a live pygame window |
 | `plot_progress.py` | Plots furthest-platform-reached and reward over training |
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-```
+Requirements:
+pygame>=2.5.0
+gymnasium>=1.0.0
+stable-baselines3>=2.4.0
+torch>=2.2.0
+numpy>=1.24,<3.0
+matplotlib>=3.7
+tensorboard>=2.15
+tqdm>=4.66
+rich>=13.7
+Pillow>=10.0
 
 ## Train
 
@@ -97,14 +98,3 @@ episode reward over time.
   platforms kick in and how far they drift
 - `NUM_PLATFORMS` — level length
 - `MAX_EPISODE_STEPS` — timeout per episode (currently ~30s at 60fps)
-
-If early training looks like the agent can never progress at all, the two
-most common fixes are lowering `GAP_GROWTH` slightly (easing the curve) or
-increasing `ent_coef` in `train.py` (more exploration).
-
-## A note on this sandbox
-
-This project was scaffolded without network access, so the files are
-syntax-checked (`py_compile`) but not run end-to-end here — you'll want to
-do a first `python train.py --timesteps 20000 --n-envs 4` smoke test on your
-own machine to confirm environment behavior before committing to a long run.
