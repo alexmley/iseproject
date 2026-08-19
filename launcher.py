@@ -1,293 +1,325 @@
 """
-launcher.py  –  Precision Platformer Gauntlet
-----------------------------------------------
-A full-screen pygame launcher with three modes:
-  1. WATCH AI   – watch the trained agent play
-  2. PLAY       – human keyboard control
-  3. TRAINING   – view the improvement chart
-
-Controls (human mode):
-  Arrow LEFT / RIGHT  – move
-  SPACE               – jump
-  ESC                 – back to menu
+launcher.py — Precision Platformer Gauntlet
+Modes: Watch AI (with checkpoint picker + speed control) | Play | Chart
 """
 
-import os
-import sys
-import math
-import time
-
+import os, sys, time
 import pygame
 import numpy as np
 
 from platformer_env import (
-    PlatformerGauntletEnv,
-    SCREEN_W, SCREEN_H,
-    AGENT_W, AGENT_H,
-    GRAVITY, JUMP_VELOCITY, MOVE_SPEED, TERMINAL_VY,
-    PLATFORM_THICKNESS, generate_level,
+    PlatformerGauntletEnv, SCREEN_W, SCREEN_H,
+    AGENT_W, AGENT_H, GRAVITY, JUMP_VELOCITY,
+    MOVE_SPEED, TERMINAL_VY, PLATFORM_THICKNESS, generate_level,
 )
 
-# ── palette ──────────────────────────────────────────────────────────────────
-BG        = (12,  14,  23)   # near-black blue
-PANEL     = (20,  24,  40)   # card background
-ACCENT    = (99, 210, 140)   # mint green  (platforms cleared)
-PLATFORM  = (75,  95, 180)   # slate blue  (platforms ahead)
-AGENT_COL = (240,200,  60)   # warm yellow
-TEXT_HI   = (230,230,230)
-TEXT_LO   = (110,120,150)
-DANGER    = (220, 80,  80)
-GOLD      = (255,200,  60)
+BG         = (12,  14,  23)
+PANEL      = (20,  24,  40)
+ACCENT     = (99, 210, 140)
+PLATFORM_C = (75,  95, 180)
+AGENT_COL  = (240, 200,  60)
+TEXT_HI    = (230, 230, 230)
+TEXT_MID   = (150, 155, 170)
+TEXT_LO    = (110, 120, 150)
+DANGER     = (220,  80,  80)
+GOLD       = (255, 200,  60)
+FPS        = 60
+SPEEDS     = [1, 2, 5, 0]
+SPEED_LBLS = ["1×", "2×", "5×", "MAX"]
 
-FPS = 60
+
+# ── model helpers ─────────────────────────────────────────────────────────────
+def list_checkpoints():
+    items = []
+    ckpt = "checkpoints"
+    if os.path.isdir(ckpt):
+        zips = sorted(
+            [f for f in os.listdir(ckpt) if f.endswith(".zip")],
+            key=lambda f: int("".join(filter(str.isdigit, f)) or 0))
+        for z in zips:
+            steps = int("".join(filter(str.isdigit, z)) or 0)
+            items.append((f"{steps:,} steps", os.path.join(ckpt, z)))
+    if os.path.exists("platformer_model.zip"):
+        items.append(("Final model", "platformer_model.zip"))
+    return items
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-def load_model():
-    """Try to import SB3 and load the trained model; return None if missing."""
+def load_model(path):
     try:
         from stable_baselines3 import PPO
-        if os.path.exists("platformer_model.zip"):
-            return PPO.load("platformer_model.zip")
-        # try latest checkpoint
-        ckpt_dir = "checkpoints"
-        if os.path.isdir(ckpt_dir):
-            zips = sorted(
-                [f for f in os.listdir(ckpt_dir) if f.endswith(".zip")],
-                key=lambda f: int(''.join(filter(str.isdigit, f)) or 0)
-            )
-            if zips:
-                return PPO.load(os.path.join(ckpt_dir, zips[-1]))
-    except Exception:
-        pass
-    return None
+        return PPO.load(path)
+    except Exception as e:
+        print(f"Load error: {e}")
+        return None
 
 
+# ── collision (AABB — fixes human mode phasing) ───────────────────────────────
+def check_landing(ax, ay, prev_ay, vy, platforms, cur_idx):
+    if vy < 0:
+        return False, ay, vy, cur_idx
+    feet_y = ay + AGENT_H
+    prev_feet_y = prev_ay + AGENT_H
+    ar = ax + AGENT_W
+    scan_end = min(cur_idx + 4, len(platforms))
+    for idx in range(max(0, cur_idx), scan_end):
+        p = platforms[idx]
+        if ar > p.x and ax < p.x_end:
+            if feet_y >= p.y and prev_feet_y <= p.y:
+                return True, p.y - AGENT_H, 0.0, idx
+    return False, ay, vy, cur_idx
+
+
+# ── shared draw ───────────────────────────────────────────────────────────────
 def draw_level(surface, platforms, cam_x, furthest_idx):
     for idx, p in enumerate(platforms):
         sx = p.x - cam_x
-        if sx + p.width < -20 or sx > SCREEN_W + 20:
+        if sx + p.width < 0 or sx > SCREEN_W:
             continue
-        color = ACCENT if idx <= furthest_idx else PLATFORM
-        # platform body
-        pygame.draw.rect(surface, color,
-                         (sx, p.y, p.width, PLATFORM_THICKNESS))
-        # subtle top highlight
-        pygame.draw.rect(surface, tuple(min(255, c+40) for c in color),
-                         (sx, p.y, p.width, 2))
+        col = ACCENT if idx <= furthest_idx else PLATFORM_C
+        pygame.draw.rect(surface, col, (int(sx), int(p.y), int(p.width), PLATFORM_THICKNESS))
 
 
-def draw_agent(surface, ax, ay, on_ground):
-    # body
-    pygame.draw.rect(surface, AGENT_COL, (ax, ay, AGENT_W, AGENT_H), border_radius=4)
-    # eyes
-    eye_y = ay + 8
-    pygame.draw.circle(surface, BG, (int(ax + 8),  int(eye_y)), 4)
-    pygame.draw.circle(surface, BG, (int(ax + 18), int(eye_y)), 4)
-    pygame.draw.circle(surface, TEXT_HI, (int(ax + 9),  int(eye_y)), 2)
-    pygame.draw.circle(surface, TEXT_HI, (int(ax + 19), int(eye_y)), 2)
-    # shadow when in air
-    if not on_ground:
-        shadow = pygame.Surface((AGENT_W, 6), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 60))
-        surface.blit(shadow, (ax, ay + AGENT_H + 2))
+def draw_agent(surface, ax, ay):
+    pygame.draw.rect(surface, AGENT_COL, (int(ax), int(ay), AGENT_W, AGENT_H))
 
 
-def draw_hud(surface, font_big, font_sm, furthest, total, step, extra=""):
-    # platform counter
-    pct  = furthest / max(total, 1)
-    bar_w = 260
-    bar_h = 10
-    bx, by = SCREEN_W - bar_w - 16, 14
-    pygame.draw.rect(surface, PANEL,  (bx, by, bar_w, bar_h), border_radius=5)
-    pygame.draw.rect(surface, ACCENT, (bx, by, int(bar_w * pct), bar_h), border_radius=5)
-    label = font_sm.render(f"Platform  {furthest} / {total}", True, TEXT_HI)
-    surface.blit(label, (bx, by + 14))
-    if extra:
-        note = font_sm.render(extra, True, TEXT_LO)
-        surface.blit(note, (16, 14))
+def draw_bar(surface, font, furthest, total):
+    bw, bh = 260, 10
+    bx, by = SCREEN_W - bw - 16, 14
+    pct = furthest / max(total, 1)
+    pygame.draw.rect(surface, PANEL,  (bx, by, bw, bh), border_radius=4)
+    if pct > 0:
+        pygame.draw.rect(surface, ACCENT, (bx, by, int(bw * pct), bh), border_radius=4)
+    pygame.draw.rect(surface, (50, 58, 90), (bx, by, bw, bh), 1, border_radius=4)
+    lbl = font.render(f"Platform  {furthest} / {total}", True, TEXT_MID)
+    surface.blit(lbl, (bx + bw - lbl.get_width(), by + bh + 5))
 
 
-def parallax_bg(surface, t):
-    """Subtle scrolling star field."""
-    rng = np.random.default_rng(42)
-    stars = rng.integers(0, [SCREEN_W * 3, SCREEN_H], size=(120, 2))
-    speeds = rng.uniform(0.1, 0.5, 120)
-    for (sx, sy), sp in zip(stars, speeds):
-        x = int(sx - t * sp * 0.3) % SCREEN_W
-        brightness = rng.integers(80, 180)
-        pygame.draw.circle(surface, (brightness,)*3, (x, int(sy)), 1)
+def draw_speed_bar(surface, font, speed_idx):
+    bw, bh, gap = 50, 22, 5
+    total_w = len(SPEEDS) * bw + (len(SPEEDS) - 1) * gap
+    sx = SCREEN_W // 2 - total_w // 2
+    sy = 12
+    for i, lbl in enumerate(SPEED_LBLS):
+        bx = sx + i * (bw + gap)
+        active = i == speed_idx
+        pygame.draw.rect(surface, ACCENT if active else PANEL, (bx, sy, bw, bh), border_radius=4)
+        pygame.draw.rect(surface, (50, 58, 90), (bx, sy, bw, bh), 1, border_radius=4)
+        t = font.render(lbl, True, BG if active else TEXT_LO)
+        surface.blit(t, (bx + bw//2 - t.get_width()//2, sy + bh//2 - t.get_height()//2))
+    hint = font.render("1 2 3 4  speed", True, TEXT_LO)
+    surface.blit(hint, (sx + total_w + 8, sy + 4))
+
+
+def draw_hint(surface, font, text, y=16):
+    surface.blit(font.render(text, True, TEXT_LO), (16, y))
 
 
 # ── MENU ──────────────────────────────────────────────────────────────────────
 def run_menu(screen, fonts):
-    font_title, font_big, font_sm = fonts
-    clock  = pygame.time.Clock()
-    t      = 0
-    has_model = os.path.exists("platformer_model.zip") or os.path.isdir("checkpoints")
-    has_log   = os.path.exists("training_log.csv")
+    font_title, font_body, font_sm = fonts
+    clock = pygame.time.Clock()
+    has_model = bool(list_checkpoints())
+    has_log = os.path.exists("training_log.csv")
 
     options = [
-        ("WATCH AI PLAY",    "See the trained agent tackle the gauntlet",  has_model, "ai"),
-        ("PLAY YOURSELF",    "Take control — how far can you get?",         True,      "human"),
-        ("TRAINING CHART",   "View the agent's learning curve",             has_log,   "chart"),
+        ("Watch AI Play",  has_model, "ai"),
+        ("Play Yourself",  True,      "human"),
+        ("Training Chart", has_log,   "chart"),
     ]
+    sel = 0
 
-    selected = 0
     while True:
-        dt = clock.tick(FPS)
-        t += dt * 0.001
-
+        clock.tick(FPS)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_UP, pygame.K_w):
-                    selected = (selected - 1) % len(options)
+                    sel = (sel - 1) % len(options)
                 if event.key in (pygame.K_DOWN, pygame.K_s):
-                    selected = (selected + 1) % len(options)
+                    sel = (sel + 1) % len(options)
                 if event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    _, _, enabled, mode = options[selected]
-                    if enabled:
-                        return mode
+                    if options[sel][1]:
+                        return options[sel][2]
                 if event.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
 
         screen.fill(BG)
-        parallax_bg(screen, t * 60)
+        title = font_title.render("PRECISION PLATFORMER GAUNTLET", True, TEXT_HI)
+        sub   = font_sm.render("Neural Network Learning Demo", True, TEXT_MID)
+        screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 72))
+        screen.blit(sub,   (SCREEN_W//2 - sub.get_width()//2, 72 + title.get_height() + 6))
 
-        # title
-        title = font_title.render("PRECISION PLATFORMER", True, TEXT_HI)
-        sub   = font_sm.render("Neural Network Gauntlet", True, ACCENT)
-        screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 80))
-        screen.blit(sub,   (SCREEN_W//2 - sub.get_width()//2,   80 + title.get_height() + 8))
+        div_y = 72 + title.get_height() + sub.get_height() + 22
+        pygame.draw.line(screen, (35, 42, 65), (SCREEN_W//4, div_y), (SCREEN_W*3//4, div_y))
 
-        # animated divider
-        div_y = 180
-        wave_w = int(abs(math.sin(t * 1.5)) * 40 + 200)
-        pygame.draw.rect(screen, ACCENT,
-                         (SCREEN_W//2 - wave_w//2, div_y, wave_w, 2))
-
-        # menu cards
-        card_w, card_h = 520, 88
-        card_x = SCREEN_W//2 - card_w//2
-        start_y = 220
-
-        for i, (name, desc, enabled, _) in enumerate(options):
-            cy    = start_y + i * (card_h + 16)
-            is_sel = i == selected
-            alpha  = 255 if enabled else 100
-
-            # card bg
-            card_col = PANEL if not is_sel else (30, 38, 65)
-            pygame.draw.rect(screen, card_col,
-                             (card_x, cy, card_w, card_h), border_radius=10)
+        iw, ih = 420, 64
+        sy = div_y + 36
+        for i, (name, enabled, _) in enumerate(options):
+            iy = sy + i * (ih + 12)
+            ix = SCREEN_W//2 - iw//2
+            is_sel = i == sel
+            pygame.draw.rect(screen, PANEL if is_sel else BG, (ix, iy, iw, ih), border_radius=6)
+            pygame.draw.rect(screen, ACCENT if is_sel else (35, 42, 65), (ix, iy, iw, ih), 1, border_radius=6)
             if is_sel:
-                pygame.draw.rect(screen, ACCENT,
-                                 (card_x, cy, card_w, card_h), 2, border_radius=10)
+                pygame.draw.rect(screen, ACCENT, (ix, iy+10, 3, ih-20))
+            col = TEXT_HI if enabled else TEXT_LO
+            ns = font_body.render(name, True, col)
+            screen.blit(ns, (ix + 20, iy + ih//2 - ns.get_height()//2))
             if not enabled:
-                pygame.draw.rect(screen, (40, 40, 50),
-                                 (card_x, cy, card_w, card_h), border_radius=10)
+                ws = font_sm.render("not available", True, DANGER)
+                screen.blit(ws, (ix + iw - ws.get_width() - 16, iy + ih//2 - ws.get_height()//2))
 
-            # text
-            col_name = TEXT_HI if enabled else TEXT_LO
-            col_desc = ACCENT  if (is_sel and enabled) else TEXT_LO
-            name_surf = font_big.render(name, True, col_name)
-            desc_surf = font_sm.render(desc if enabled else desc + "  [no model found]",
-                                       True, col_desc)
-            screen.blit(name_surf, (card_x + 24, cy + 14))
-            screen.blit(desc_surf, (card_x + 24, cy + 14 + name_surf.get_height() + 4))
-
-            # arrow
-            if is_sel and enabled:
-                ax = card_x + card_w - 36
-                ay = cy + card_h//2
-                pts = [(ax, ay-8), (ax+14, ay), (ax, ay+8)]
-                pygame.draw.polygon(screen, ACCENT, pts)
-
-        # footer
-        foot = font_sm.render("↑ ↓  navigate      ENTER  select      ESC  quit",
-                               True, TEXT_LO)
-        screen.blit(foot, (SCREEN_W//2 - foot.get_width()//2, SCREEN_H - 36))
-
+        foot = font_sm.render("↑ ↓  navigate      ENTER  select      ESC  quit", True, TEXT_LO)
+        screen.blit(foot, (SCREEN_W//2 - foot.get_width()//2, SCREEN_H - 30))
         pygame.display.flip()
 
 
-# ── AI PLAYBACK ───────────────────────────────────────────────────────────────
-def run_ai_mode(screen, fonts, model):
-    _, font_big, font_sm = fonts
+# ── CHECKPOINT PICKER ─────────────────────────────────────────────────────────
+def run_checkpoint_picker(screen, fonts):
+    font_title, font_body, font_sm = fonts
     clock = pygame.time.Clock()
-    env   = PlatformerGauntletEnv(render_mode=None, seed=0)
+    items = list_checkpoints()
+    if not items:
+        return None
 
+    sel = len(items) - 1
+    scroll = 0
+    VIS = 8
+    ih = 52
+
+    while True:
+        clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_UP, pygame.K_w):
+                    sel = max(0, sel - 1)
+                    scroll = min(scroll, sel)
+                if event.key in (pygame.K_DOWN, pygame.K_s):
+                    sel = min(len(items) - 1, sel + 1)
+                    scroll = max(scroll, sel - VIS + 1)
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    return items[sel]
+                if event.key == pygame.K_ESCAPE:
+                    return None
+
+        screen.fill(BG)
+        title = font_title.render("SELECT CHECKPOINT", True, TEXT_HI)
+        sub   = font_sm.render("Choose training snapshot — ENTER to load", True, TEXT_MID)
+        screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 56))
+        screen.blit(sub,   (SCREEN_W//2 - sub.get_width()//2, 56 + title.get_height() + 6))
+
+        iw, ix = 480, SCREEN_W//2 - 240
+        sy = 140
+        for i, (label, path) in enumerate(items[scroll:scroll+VIS]):
+            real_idx = scroll + i
+            iy = sy + i * (ih + 8)
+            is_sel = real_idx == sel
+            is_final = path == "platformer_model.zip"
+            pygame.draw.rect(screen, PANEL if is_sel else BG, (ix, iy, iw, ih), border_radius=6)
+            pygame.draw.rect(screen, ACCENT if is_sel else (35,42,65), (ix, iy, iw, ih), 1, border_radius=6)
+            if is_sel:
+                pygame.draw.rect(screen, ACCENT, (ix, iy+8, 3, ih-16))
+            ls = font_body.render(label, True, TEXT_HI if is_sel else TEXT_MID)
+            screen.blit(ls, (ix+20, iy + ih//2 - ls.get_height()//2))
+            if is_final:
+                tag = font_sm.render("FINAL", True, GOLD)
+                screen.blit(tag, (ix + iw - tag.get_width() - 16, iy + ih//2 - tag.get_height()//2))
+
+        foot = font_sm.render("↑ ↓  select      ENTER  load      ESC  back", True, TEXT_LO)
+        screen.blit(foot, (SCREEN_W//2 - foot.get_width()//2, SCREEN_H - 30))
+        pygame.display.flip()
+
+
+# ── AI WATCH ──────────────────────────────────────────────────────────────────
+def run_ai_mode(screen, fonts):
+    _, font_body, font_sm = fonts
+    clock = pygame.time.Clock()
+
+    chosen = run_checkpoint_picker(screen, fonts)
+    if chosen is None:
+        return
+    label, path = chosen
+
+    screen.fill(BG)
+    msg = font_body.render(f"Loading {label}...", True, TEXT_MID)
+    screen.blit(msg, (SCREEN_W//2 - msg.get_width()//2, SCREEN_H//2))
+    pygame.display.flip()
+
+    model = load_model(path)
+    if model is None:
+        return
+
+    env = PlatformerGauntletEnv(render_mode=None, seed=0)
     episode = 0
+    speed_idx = 0
+
     while True:
         episode += 1
-        obs, info = env.reset(seed=episode)
+        obs, _ = env.reset(seed=episode)
         done = False
-        t    = 0
 
         while not done:
-            t += 1
+            spd = SPEEDS[speed_idx]
+            if spd:
+                clock.tick(FPS * spd)
+            else:
+                pygame.event.pump()
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     env.close(); pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    env.close(); return
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        env.close(); return
+                    for k, idx in [(pygame.K_1,0),(pygame.K_2,1),(pygame.K_3,2),(pygame.K_4,3)]:
+                        if event.key == k:
+                            speed_idx = idx
 
-            if model:
-                action, _ = model.predict(obs, deterministic=True)
-            else:
-                action = env.action_space.sample()
-
-            obs, reward, terminated, truncated, info = env.step(action)
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
-            cam_x = env.agent_x - SCREEN_W * 0.3
-            screen.fill(BG)
-            parallax_bg(screen, t)
-            draw_level(screen, env.platforms, cam_x, env.furthest_platform_idx)
-            ax = env.agent_x - cam_x
-            draw_agent(screen, ax, env.agent_y, env.on_ground)
-            draw_hud(screen, font_big, font_sm,
-                     env.furthest_platform_idx,
-                     len(env.platforms) - 1,
-                     env.steps,
-                     extra=f"Episode {episode}   ESC = menu")
-            pygame.display.flip()
-            clock.tick(FPS)
+            if spd <= 2 or episode % 3 == 0:
+                cam_x = env.agent_x - SCREEN_W * 0.3
+                screen.fill(BG)
+                draw_level(screen, env.platforms, cam_x, env.furthest_platform_idx)
+                draw_agent(screen, env.agent_x - cam_x, env.agent_y)
+                draw_bar(screen, font_sm, env.furthest_platform_idx, len(env.platforms)-1)
+                draw_speed_bar(screen, font_sm, speed_idx)
+                draw_hint(screen, font_sm, f"Episode {episode}   [{label}]   ESC → menu", y=44)
+                pygame.display.flip()
 
-        # brief pause between episodes
-        time.sleep(0.6)
+        time.sleep(0.3)
 
 
 # ── HUMAN PLAY ────────────────────────────────────────────────────────────────
 def run_human_mode(screen, fonts):
-    _, font_big, font_sm = fonts
+    _, font_body, font_sm = fonts
     clock = pygame.time.Clock()
-
-    best_platform = 0
-    episode       = 0
+    best_ever = 0
+    episode = 0
 
     while True:
         episode += 1
         platforms = generate_level(seed=0)
-        start     = platforms[0]
+        start = platforms[0]
         ax = start.x + start.width / 2 - AGENT_W / 2
         ay = start.y - AGENT_H
         vx = vy = 0.0
+        prev_ay = ay
         on_ground = True
-        furthest  = 0
-        cur_plat  = 0
-        furthest_x = ax
-        t = steps = 0
-        done = False
-        death_msg = ""
+        furthest = 0
+        cur_idx = 0
+        t = 0
 
-        while not done:
-            steps += 1
-            t     += 1
+        running = True
+        while running:
             clock.tick(FPS)
-
+            t += 1
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
@@ -295,72 +327,51 @@ def run_human_mode(screen, fonts):
                     return
 
             keys = pygame.key.get_pressed()
-            if keys[pygame.K_LEFT]:
-                vx = -MOVE_SPEED
-            elif keys[pygame.K_RIGHT]:
-                vx = MOVE_SPEED
-            else:
-                vx = 0.0
-
+            vx = (-MOVE_SPEED if keys[pygame.K_LEFT] else
+                   MOVE_SPEED if keys[pygame.K_RIGHT] else 0.0)
             if (keys[pygame.K_SPACE] or keys[pygame.K_UP]) and on_ground:
-                vy        = JUMP_VELOCITY
+                vy = JUMP_VELOCITY
                 on_ground = False
 
-            vy   = min(vy + GRAVITY, TERMINAL_VY)
+            vy = min(vy + GRAVITY, TERMINAL_VY)
             prev_ay = ay
-            ax  += vx
-            ay  += vy
+            ax += vx
+            ay += vy
 
-            # update moving platforms
             for p in platforms:
                 p.update(t)
 
-            # collision
-            landed = False
-            if vy >= 0:
-                feet_y      = ay + AGENT_H
-                prev_feet_y = prev_ay + AGENT_H
-                mid_x       = ax + AGENT_W * 0.5
-                for idx, p in enumerate(platforms):
-                    if p.x <= mid_x <= p.x_end:
-                        if feet_y >= p.y and prev_feet_y <= p.y:
-                            ay        = p.y - AGENT_H
-                            vy        = 0.0
-                            on_ground = True
-                            cur_plat  = idx
-                            landed    = True
-                            if idx > furthest:
-                                furthest = idx
-                                best_platform = max(best_platform, idx)
-                            break
-            if not landed:
+            landed, ay, vy, new_idx = check_landing(ax, ay, prev_ay, vy, platforms, cur_idx)
+            if landed:
+                on_ground = True
+                cur_idx = new_idx
+                if new_idx > furthest:
+                    furthest = new_idx
+                    best_ever = max(best_ever, furthest)
+            else:
                 on_ground = False
-
-            # void death
-            if ay > SCREEN_H + 100:
-                done      = True
-                death_msg = f"Reached platform {furthest}  —  best ever: {best_platform}"
 
             cam_x = ax - SCREEN_W * 0.3
             screen.fill(BG)
-            parallax_bg(screen, t)
             draw_level(screen, platforms, cam_x, furthest)
-            draw_agent(screen, ax - cam_x, ay, on_ground)
-            draw_hud(screen, font_big, font_sm,
-                     furthest, len(platforms) - 1, steps,
-                     extra=f"SPACE/↑ jump   ←→ move   ESC menu   Best: {best_platform}")
+            draw_agent(screen, ax - cam_x, ay)
+            draw_bar(screen, font_sm, furthest, len(platforms)-1)
+            draw_hint(screen, font_sm, f"← → move   SPACE jump   ESC menu   Best: {best_ever}")
             pygame.display.flip()
+
+            if ay > SCREEN_H + 100:
+                running = False
 
         # death screen
         overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
+        overlay.fill((0, 0, 0, 150))
         screen.blit(overlay, (0, 0))
-        msg1 = font_big.render("YOU FELL", True, DANGER)
-        msg2 = font_sm.render(death_msg, True, TEXT_HI)
-        msg3 = font_sm.render("ENTER to retry   ESC for menu", True, TEXT_LO)
-        screen.blit(msg1, (SCREEN_W//2 - msg1.get_width()//2, SCREEN_H//2 - 60))
-        screen.blit(msg2, (SCREEN_W//2 - msg2.get_width()//2, SCREEN_H//2))
-        screen.blit(msg3, (SCREEN_W//2 - msg3.get_width()//2, SCREEN_H//2 + 50))
+        for txt, col, dy in [
+            (font_body.render(f"Reached platform {furthest} / {len(platforms)-1}", True, TEXT_HI), TEXT_HI, -40),
+            (font_sm.render(f"Personal best: {best_ever}", True, TEXT_MID), TEXT_MID, 0),
+            (font_sm.render("ENTER retry   ESC menu", True, TEXT_LO), TEXT_LO, 36),
+        ]:
+            screen.blit(txt, (SCREEN_W//2 - txt.get_width()//2, SCREEN_H//2 + dy))
         pygame.display.flip()
 
         waiting = True
@@ -369,112 +380,74 @@ def run_human_mode(screen, fonts):
                 if event.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
                 if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_RETURN:
-                        waiting = False
-                    if event.key == pygame.K_ESCAPE:
-                        return
+                    if event.key == pygame.K_RETURN: waiting = False
+                    if event.key == pygame.K_ESCAPE: return
 
 
 # ── CHART ─────────────────────────────────────────────────────────────────────
 def run_chart_mode(screen, fonts):
-    """Render a live training chart directly in pygame (no matplotlib window)."""
-    _, font_big, font_sm = fonts
+    _, font_body, font_sm = fonts
     clock = pygame.time.Clock()
-
     import csv
+
     try:
         with open("training_log.csv") as f:
-            rows   = list(csv.DictReader(f))
-            vals   = [int(r["furthest_platform"]) for r in rows]
-            total  = int(rows[0]["total_platforms"]) if rows else 40
+            rows = list(csv.DictReader(f))
+            vals = [int(r["furthest_platform"]) for r in rows]
+            total = int(rows[0]["total_platforms"]) if rows else 40
     except Exception:
         vals, total = [], 40
 
     if not vals:
-        waiting = True
-        while waiting:
+        while True:
             screen.fill(BG)
-            msg = font_big.render("No training_log.csv found — run train.py first",
-                                  True, DANGER)
+            msg = font_body.render("No training_log.csv — run train.py first", True, DANGER)
             screen.blit(msg, (SCREEN_W//2 - msg.get_width()//2, SCREEN_H//2))
             pygame.display.flip()
             for event in pygame.event.get():
-                if event.type in (pygame.QUIT,) or (
-                   event.type == pygame.KEYDOWN and
-                   event.key == pygame.K_ESCAPE):
-                    return
+                if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return
             clock.tick(FPS)
         return
 
-    # rolling average
     window = max(1, len(vals) // 20)
-    kernel = np.ones(window) / window
-    smooth = np.convolve(vals, kernel, mode="valid")
+    smooth = np.convolve(vals, np.ones(window)/window, mode="valid")
+    PAD = 64
+    cw = SCREEN_W - PAD*2
+    ch = SCREEN_H - PAD*2 - 48
 
-    PAD = 60
-    cw  = SCREEN_W - PAD * 2
-    ch  = SCREEN_H - PAD * 2 - 60
+    def to_px(i, v, n):
+        return (PAD + int(i/max(n-1,1)*cw),
+                PAD + int((1 - v/max(total,1))*ch))
 
-    def to_px(i, v):
-        x = PAD + int(i / max(len(vals)-1, 1) * cw)
-        y = PAD + 40 + int((1 - v / total) * ch)
-        return x, y
-
-    running = True
-    while running:
+    while True:
         clock.tick(FPS)
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+            if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return
 
         screen.fill(BG)
+        for tick in range(0, total+1, 5):
+            gy = PAD + int((1 - tick/total)*ch)
+            pygame.draw.line(screen, PANEL, (PAD, gy), (PAD+cw, gy))
+            screen.blit(font_sm.render(str(tick), True, TEXT_LO), (PAD-30, gy-8))
 
-        # grid lines
-        for tick in range(0, total + 1, 10):
-            y = PAD + 40 + int((1 - tick / total) * ch)
-            pygame.draw.line(screen, PANEL, (PAD, y), (PAD + cw, y))
-            lbl = font_sm.render(str(tick), True, TEXT_LO)
-            screen.blit(lbl, (PAD - lbl.get_width() - 6, y - 8))
-
-        # scatter dots
+        n = len(vals)
         for i, v in enumerate(vals):
-            px, py = to_px(i, v)
-            pygame.draw.circle(screen, (*PLATFORM, 120), (px, py), 2)
+            pygame.draw.circle(screen, (*PLATFORM_C, 100), to_px(i, v, n), 2)
 
-        # rolling average line
-        offset = (len(vals) - len(smooth)) // 2
-        pts = [to_px(offset + i, v) for i, v in enumerate(smooth)]
+        off = (n - len(smooth)) // 2
+        pts = [to_px(off+i, v, n) for i, v in enumerate(smooth)]
         if len(pts) > 1:
             pygame.draw.lines(screen, GOLD, False, pts, 2)
 
-        # full level line
-        pygame.draw.line(screen, ACCENT,
-                         (PAD, PAD + 40), (PAD + cw, PAD + 40), 1)
-        lbl = font_sm.render(f"full level ({total})", True, ACCENT)
-        screen.blit(lbl, (PAD + cw - lbl.get_width(), PAD + 44))
-
-        # labels
-        title = font_big.render("Skill Improvement over Training", True, TEXT_HI)
+        pygame.draw.rect(screen, (35,42,65), (PAD, PAD, cw, ch), 1)
+        title = font_body.render("Skill Improvement over Training", True, TEXT_HI)
         screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 14))
-
-        xl = font_sm.render("Episode →", True, TEXT_LO)
-        screen.blit(xl, (SCREEN_W//2 - xl.get_width()//2, SCREEN_H - 28))
-
-        yl = font_sm.render("Furthest Platform", True, TEXT_LO)
-        yl = pygame.transform.rotate(yl, 90)
-        screen.blit(yl, (10, SCREEN_H//2 - yl.get_height()//2))
-
-        stats = (f"Episodes: {len(vals)}   "
-                 f"Max: {max(vals)}   "
-                 f"Avg (last {window}): {np.mean(vals[-window:]):.1f}")
-        st = font_sm.render(stats, True, ACCENT)
-        screen.blit(st, (PAD, SCREEN_H - 28))
-
-        esc_hint = font_sm.render("ESC  back to menu", True, TEXT_LO)
-        screen.blit(esc_hint, (SCREEN_W - esc_hint.get_width() - 16, SCREEN_H - 28))
-
+        stats = f"Episodes: {n}   Max: {max(vals)}   Rolling avg ({window}): {np.mean(vals[-window:]):.1f}"
+        screen.blit(font_sm.render(stats, True, TEXT_MID), (PAD, SCREEN_H-28))
+        hint = font_sm.render("ESC  back to menu", True, TEXT_LO)
+        screen.blit(hint, (SCREEN_W - hint.get_width() - 16, SCREEN_H-28))
         pygame.display.flip()
 
 
@@ -483,23 +456,16 @@ def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     pygame.display.set_caption("Precision Platformer Gauntlet")
-
-    # fonts
-    font_title = pygame.font.SysFont("Arial Black", 42, bold=True)
-    font_big   = pygame.font.SysFont("Arial",       22, bold=True)
-    font_sm    = pygame.font.SysFont("Arial",        16)
-    fonts      = (font_title, font_big, font_sm)
-
-    model = load_model()
-
+    fonts = (
+        pygame.font.SysFont("Arial", 28, bold=True),
+        pygame.font.SysFont("Arial", 20, bold=True),
+        pygame.font.SysFont("Arial", 14),
+    )
     while True:
         mode = run_menu(screen, fonts)
-        if mode == "ai":
-            run_ai_mode(screen, fonts, model)
-        elif mode == "human":
-            run_human_mode(screen, fonts)
-        elif mode == "chart":
-            run_chart_mode(screen, fonts)
+        if mode == "ai":     run_ai_mode(screen, fonts)
+        elif mode == "human": run_human_mode(screen, fonts)
+        elif mode == "chart": run_chart_mode(screen, fonts)
 
 
 if __name__ == "__main__":
