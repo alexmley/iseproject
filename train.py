@@ -71,7 +71,7 @@ def main():
             n_steps=2048, batch_size=256, n_epochs=10,
             learning_rate=get_linear_fn(3e-4, 1e-5, 1.0),
             gamma=0.99, gae_lambda=0.95,
-            ent_coef=0.08,
+            ent_coef=0.04,
             clip_range=0.2, vf_coef=0.5, max_grad_norm=0.5,
             tensorboard_log="./tb_logs",
         )
