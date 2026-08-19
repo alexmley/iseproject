@@ -86,6 +86,13 @@ a viewer.
 python plot_progress.py
 ```
 
+## Play the platformer, or visualize the agents progress:
+
+```bash
+python launcher.py
+```
+you have the option to see the agent play at certain checkpoints, play yourself, and see the graph of the agent's improvement over iterations.
+
 Produces `progress.png` with two panels: furthest platform reached per
 episode (with a rolling average climbing toward the top of the level), and
 episode reward over time.
